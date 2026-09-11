@@ -1,0 +1,103 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isMember(groupId) {
+      return signedIn()
+        && exists(
+          /databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)
+        );
+    }
+
+    function isGroupMember(groupId, uid) {
+      return signedIn()
+        && exists(
+          /databases/$(database)/documents/groups/$(groupId)/members/$(uid)
+        );
+    }
+
+    match /groups/{groupId} {
+      // Needed so a signed-in user can verify a group code before joining.
+      allow get: if signedIn();
+
+      // Only the creator can create the group document.
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid;
+
+      // Group metadata is managed by trusted application logic, not the client.
+      allow update, delete: if false;
+
+      match /members/{uid} {
+        // Existing members can see the member list; a user can also read their own member doc.
+        allow read: if isMember(groupId)
+          || (signedIn() && uid == request.auth.uid);
+
+        // A user may only create their own membership document.
+        allow create: if signedIn()
+          && uid == request.auth.uid;
+
+        // A user may only edit their own membership document.
+        allow update: if signedIn()
+          && uid == request.auth.uid;
+
+        // A user may only delete their own membership document.
+        allow delete: if signedIn()
+          && uid == request.auth.uid;
+
+        match /devices/{deviceId} {
+          // FCM tokens/devices belong only to their owner.
+          allow read: if signedIn()
+            && uid == request.auth.uid;
+
+          allow create, update: if signedIn()
+            && uid == request.auth.uid
+            && request.resource.data.uid == request.auth.uid
+            && request.resource.data.token is string
+            && request.resource.data.token.size() > 0;
+
+          allow delete: if signedIn()
+            && uid == request.auth.uid;
+        }
+      }
+
+      match /messages/{messageId} {
+        allow read: if isMember(groupId);
+
+        allow create: if isMember(groupId)
+          && request.resource.data.uid == request.auth.uid;
+
+        allow update, delete: if false;
+      }
+
+      match /scheduledNotifications/{notificationId} {
+        // A member can read only notifications addressed to them or created by them.
+        allow read: if isMember(groupId)
+          && (
+            resource.data.targetUid == request.auth.uid
+            || resource.data.senderUid == request.auth.uid
+          );
+
+        // The sender must be a group member, and the target must also be a member
+        // of this same group. The notification must be pending and scheduled ahead.
+        allow create: if isMember(groupId)
+          && request.resource.data.senderUid == request.auth.uid
+          && request.resource.data.targetUid != request.auth.uid
+          && isGroupMember(
+            groupId,
+            request.resource.data.targetUid
+          )
+          && request.resource.data.status == 'pending'
+          && request.resource.data.scheduledAt > request.time;
+
+        // Cloud Functions use Admin SDK and therefore bypass these client rules.
+        // Clients cannot alter or delete an existing scheduled notification.
+        allow update, delete: if false;
+      }
+    }
+  }
+}
